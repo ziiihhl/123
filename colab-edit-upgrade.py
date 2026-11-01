@@ -309,7 +309,8 @@ def resolve_civitai_lora(link,target,version_id=None,token=''):
         parts=target.split(':')
         if len(parts)!=3 or parts[1] not in ('local','drive'):raise CivitaiLoraError('模型下载位置无效。')
         _,destination,base_target=parts;kind='checkpoint'
-    if base_target not in LORA_TARGETS:raise CivitaiLoraError('请选择目标模型。')
+    auto_target=kind=='checkpoint' and base_target=='auto'
+    if not auto_target and base_target not in LORA_TARGETS:raise CivitaiLoraError('请选择目标模型。')
     parsed=parse_civitai_link(link)
     model=None;versions=[]
     if parsed['model_id']:
@@ -335,6 +336,10 @@ def resolve_civitai_lora(link,target,version_id=None,token=''):
                           download_url=file.get('downloadUrl') or 'https://civitai.com/api/download/models/'+str(chosen)))
     if not files:raise CivitaiLoraError('该版本没有带 SHA256 的 safetensors 模型文件。')
     family=_base_family(version.get('baseModel'))
+    if auto_target:
+        base_target={'SDXL':'hassaku','Anima':'anima','Krea2':'krea_anime'}.get(family)
+        if not base_target:raise CivitaiLoraError('暂时无法自动识别此模型架构；当前支持 SDXL / Illustrious、Anima 和 Krea2。')
+        target='model:'+destination+':'+base_target
     compatible=family in (None,LORA_TARGETS[base_target]['family'])
     warning='' if family==LORA_TARGETS[base_target]['family'] else ('Civitai 未明确标注可识别的基础架构，请自行确认兼容性。' if family is None else '基础模型与所选目标不匹配，请改选目标模型或版本。')
     return dict(target=target,kind=kind,destination=destination,family=LORA_TARGETS[base_target]['family'],model_id=version.get('modelId'),model_name=model_info.get('name',''),
@@ -359,6 +364,49 @@ def choose_civitai_file(info,file_id):
     return dict(name=filename,kind=kind,destination=info.get('destination','drive'),folder=(('checkpoints' if info['family']=='SDXL' else 'diffusion_models') if kind=='checkpoint' else info['family']),size=file['size'],sha256=file['sha256'],civitai_only=True,
                 download_url=urllib.parse.urlunsplit(('https','civitai.com',parsed.path,urllib.parse.urlencode(query),'')),
                 version_id=info['version_id'],file_id=file_id,model_id=info['model_id'],trained_words=info['trained_words'],model_name=info['model_name'])
+
+
+"""Drive-backed opt-in startup models; never execute data from download records."""
+def startup_model_spec(spec):
+    import re
+    name=spec.get('name','');folder=spec.get('folder');size=spec.get('size');sha=str(spec.get('sha256','')).lower()
+    if not isinstance(name,str) or not name.endswith('.safetensors') or '/' in name or '\\' in name or name.startswith('.'):
+        raise ValueError('Invalid startup model filename')
+    if folder not in ('checkpoints','diffusion_models') or not isinstance(size,int) or size<=0 or not re.fullmatch('[a-f0-9]{64}',sha):
+        raise ValueError('Invalid startup model metadata')
+    if any(not isinstance(spec.get(key),int) or spec[key]<=0 for key in ('version_id','file_id')):raise ValueError('Invalid Civitai identifiers')
+    return dict(name=name,folder=folder,size=size,sha256=sha,version_id=spec['version_id'],file_id=spec['file_id'])
+
+def load_startup_models(models,user_directory):
+    import json,re
+    from pathlib import Path
+    user_directory=Path(user_directory);result=list(models)
+    known={(s.get('version_id'),s.get('file_id')) for s in result if s.get('file_id')}
+    names={(s.get('folder'),s.get('name')) for s in result}
+    registry=user_directory/'startup_models'
+    if not registry.is_dir():return result
+    for path in sorted(registry.glob('*.json'))[:2000]:
+        try:
+            entry=json.loads(path.read_text(encoding='utf-8'));spec=startup_model_spec(entry['spec'])
+            if not entry.get('completed'):
+                job_id=entry.get('job_id','')
+                if not isinstance(job_id,str) or not re.fullmatch('[a-f0-9]{32}',job_id):continue
+                job=json.loads((user_directory/'lora_download_jobs'/(job_id+'.json')).read_text(encoding='utf-8'))
+                if job.get('status')!='success' or job.get('file_id')!=spec['file_id'] or job.get('version_id')!=spec['version_id']:continue
+                if (job.get('result') or {}).get('sha256','').lower()!=spec['sha256']:continue
+            identity=(spec['version_id'],spec['file_id']);filename=(spec['folder'],spec['name'])
+            if identity in known or filename in names:continue
+            result.append(spec);known.add(identity);names.add(filename)
+            print('记事本启动列表：',spec['name'],flush=True)
+        except (OSError,ValueError,TypeError,KeyError):continue
+    return result
+
+def remember_direct_model(user_directory,spec):
+    import json,uuid
+    from pathlib import Path
+    spec=startup_model_spec(spec);root=Path(user_directory)/'startup_models';root.mkdir(parents=True,exist_ok=True)
+    target=root/(uuid.uuid4().hex+'.json');temporary=target.with_suffix('.tmp')
+    temporary.write_text(json.dumps(dict(version=1,spec=spec,completed=True),ensure_ascii=False),encoding='utf-8');temporary.replace(target)
 
 
 """Colab metadata/hash index: stores no tensors or credentials, never loads model weights."""
@@ -662,6 +710,7 @@ def start_lora_download_worker(root,index_path):
     globals()['_comfy_lora_download_thread']=thread;thread.start()
     print('网页 LoRA 下载接收程序已启动；只处理你在网页确认提交的下载任务。',flush=True)
     return thread
+
 
 
 """Install editing adapters/nodes, preserving the Colab runtime and existing main models."""
